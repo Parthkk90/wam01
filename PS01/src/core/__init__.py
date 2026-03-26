@@ -4,3 +4,8 @@ from .phi4_compactor import Phi4Compactor
 from .adversarial_guard import AdversarialGuard
 from .derives_worker import DerivesWorker
 from .wal import WALLogger
+from .pipeline_orchestrator import PipelineOrchestrator
+from .cbs_preseeder import CBSPreseeder
+from .briefing_builder import BriefingBuilder
+from .voice_bot import VoiceBot
+from .evaluation_harness import EvaluationHarness

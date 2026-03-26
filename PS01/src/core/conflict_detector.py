@@ -25,8 +25,12 @@ class ConflictDetector:
                         guard_result = guard.check(new_fact.get('type', ''), float(old_val), float(new_val))
                         conflict["suspicious"] = guard_result["suspicious"]
                         conflict["review_required"] = guard_result["suspicious"]
+                        conflict["reason"] = guard_result["reason"]
+                        conflict["pct_change"] = guard_result["pct_change"]
                     else:
                         conflict["suspicious"] = False
                         conflict["review_required"] = False
+                        conflict["reason"] = "non-numeric comparison"
+                        conflict["pct_change"] = 0.0
                     conflicts.append(conflict)
         return conflicts

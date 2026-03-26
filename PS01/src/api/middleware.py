@@ -1,8 +1,10 @@
 # src/api/middleware.py
 import sqlite3
-from datetime import datetime
+from datetime import datetime, UTC
 from functools import wraps
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 
 class ConsentDB:
@@ -52,7 +54,7 @@ class ConsentDB:
                     session_id,
                     customer_id,
                     scope,
-                    datetime.utcnow().isoformat(),
+                    datetime.now(UTC).isoformat(),
                     sig_method,
                     bank_id,
                 ),
@@ -95,3 +97,27 @@ def require_consent(scope: str):
             return await func(*args, session_id=session_id, **kwargs)
         return wrapper
     return decorator
+
+
+class ConsentMiddleware(BaseHTTPMiddleware):
+    """
+    FastAPI middleware to enforce consent checking on protected routes.
+    Exempt demo routes from consent requirement.
+    """
+    
+    EXEMPT_PATHS = {
+        "/health",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+    }
+    
+    async def dispatch(self, request: Request, call_next):
+        # Exempt health checks and API docs
+        if request.url.path in self.EXEMPT_PATHS or request.url.path.startswith("/demo"):
+            return await call_next(request)
+        
+        # For protected routes, consent checking would be enforced by @require_consent decorator
+        # on individual endpoints. This middleware just sets up the context.
+        response = await call_next(request)
+        return response

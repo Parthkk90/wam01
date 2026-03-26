@@ -2,7 +2,7 @@
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from uuid import uuid4
@@ -26,14 +26,21 @@ class WALLogger:
         """Append facts to WAL before mem0.add().
 
         WAL rule: always write here BEFORE calling mem0.add().
+        Filters out token_mapping to prevent raw PII in WAL.
         """
+        # Filter out token_mapping to prevent raw PII leakage
+        cleaned_facts = []
+        for fact in facts:
+            cleaned_fact = {k: v for k, v in fact.items() if k != "token_mapping"}
+            cleaned_facts.append(cleaned_fact)
+        
         entry = {
             "session_id": session_id,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(UTC).isoformat() + "Z",
             "customer_id": customer_id,
             "agent_id": agent_id,
             "bank_id": bank_id,
-            "facts": facts,
+            "facts": cleaned_facts,
             "idempotency_key": idempotency_key or str(uuid4()),
             "shipped": False,
         }
