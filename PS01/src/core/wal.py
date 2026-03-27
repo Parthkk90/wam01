@@ -22,7 +22,7 @@ class WALLogger:
         bank_id: str,
         facts: List[Dict[str, Any]],
         idempotency_key: Optional[str] = None,
-    ):
+    ) -> Dict[str, Any]:
         """Append facts to WAL before mem0.add().
 
         WAL rule: always write here BEFORE calling mem0.add().
@@ -36,7 +36,7 @@ class WALLogger:
         
         entry = {
             "session_id": session_id,
-            "timestamp": datetime.now(UTC).isoformat() + "Z",
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "customer_id": customer_id,
             "agent_id": agent_id,
             "bank_id": bank_id,
@@ -47,6 +47,7 @@ class WALLogger:
         with self._lock:
             with open(self.wal_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+        return entry
 
     def replay(self, session_id: str) -> List[Dict[str, Any]]:
         """Replay WAL entries for recovery."""

@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional, List
 import json
 import os
 import logging
+from datetime import datetime, timezone
 from .conversation_engine import ConversationEngine
 
 # Banking ID for composite user_id
@@ -95,6 +96,19 @@ class BriefingBuilder:
         This is faster and avoids RAM issues with Phi-4-Mini in memory.add().
         """
         memories = []
+        summary_context = ""
+
+        # Pull compacted summary first to keep context bounded in downstream prompts.
+        if self.redis_cache:
+            try:
+                summary_raw = await self.redis_cache.get(f"summary:{customer_id}")
+                if summary_raw:
+                    if isinstance(summary_raw, bytes):
+                        summary_raw = summary_raw.decode()
+                    summary_obj = json.loads(summary_raw) if isinstance(summary_raw, str) else summary_raw
+                    summary_context = str(summary_obj.get("summary_text", "")).strip()
+            except Exception:
+                pass
 
         # **CRITICAL FIX**: Read facts directly from WAL instead of Mem0
         # WAL contains all facts written during previous sessions (via /session/end)
@@ -106,7 +120,12 @@ class BriefingBuilder:
 
                 for entry in all_entries:
                     facts = entry.get("facts", [])
-                    customer_facts.extend(facts)
+                    ts = entry.get("timestamp")
+                    for fact in facts:
+                        if isinstance(fact, dict):
+                            fact = dict(fact)
+                            fact["timestamp"] = ts
+                            customer_facts.append(fact)
                 
                 # Convert to memory format
                 for fact in customer_facts:
@@ -116,23 +135,56 @@ class BriefingBuilder:
                             "content": f"{fact.get('type')}: {fact.get('value')}",
                             "type": fact.get("type"),
                             "value": fact.get("value"),
-                            "verified": fact.get("verified", False)
+                            "verified": fact.get("verified", False),
+                            "timestamp": fact.get("timestamp"),
                         })
                 logger.info(f"Retrieved {len(memories)} facts from WAL for {customer_id}")
             except Exception as e:
                 logger.debug(f"WAL retrieval failed: {e}")
                 memories = []
         
-        # Fallback to Mem0 if WAL fails (graceful degradation)
-        if not memories and self.memory:
+        # Merge Mem0 retrieval with WAL-derived facts to improve semantic recall.
+        if self.memory:
             try:
                 composite_user_id = f"{BANK_ID}::{customer_id}"
-                memories = self.memory.search(
+                mem0_hits = self.memory.search(
                     query="customer income co-applicant property verification facts",
-                    user_id=composite_user_id
+                    user_id=composite_user_id,
                 )
-            except Exception as e:
-                memories = []
+
+                if mem0_hits:
+                    seen = {
+                        f"{m.get('type')}|{m.get('value')}|{m.get('content')}"
+                        for m in memories
+                    }
+                    for hit in mem0_hits:
+                        if not isinstance(hit, dict):
+                            continue
+                        content = str(hit.get("content", "")).strip()
+                        merged = {
+                            "id": hit.get("id", ""),
+                            "content": content,
+                            "type": hit.get("type", "mem0"),
+                            "value": hit.get("value", content),
+                            "verified": hit.get("verified", False),
+                        }
+                        key = f"{merged.get('type')}|{merged.get('value')}|{merged.get('content')}"
+                        if key not in seen:
+                            memories.append(merged)
+                            seen.add(key)
+            except Exception:
+                # Keep WAL-derived memories if Mem0 lookup fails.
+                pass
+
+        # Extract conversation context (if available)
+        conversation_context = summary_context
+        for mem in memories:
+            if mem.get("type") == "conversation_summary":
+                conversation_context = mem.get("value", "")
+                break
+
+        deterministic_recall = self._build_deterministic_recall(memories)
+        preferred_language = self._extract_preferred_language(memories)
 
         # Extract facts from memories
         verified_facts = []
@@ -194,10 +246,13 @@ class BriefingBuilder:
             "session_count": len(memories) if len(memories) > 0 else 0,  # If we have facts, it's a returning customer (session_count >= 1)
             "verified_facts": verified_facts,
             "unverified_facts": unverified_facts,
+            "facts": verified_facts + unverified_facts,
             "pending_review": pending_review,
             "recommended_next_step": recommended_next_step,
             "flags": self._extract_flags(memories),
-            "last_updated": self._get_timestamp()
+            "last_updated": self._get_timestamp(),
+            "deterministic_recall": deterministic_recall,
+            "preferred_language": preferred_language,
         }
 
         # Add health checks if health checker is available (Phase 6)
@@ -218,6 +273,7 @@ class BriefingBuilder:
                 customer_id=customer_id,
                 customer_name=briefing.get("customer_name") or "there",
                 facts=all_facts,
+                conversation_context=conversation_context,  # ← PASS CONTEXT
                 flags=briefing["flags"],
                 session_count=briefing["session_count"]
             )
@@ -253,5 +309,57 @@ class BriefingBuilder:
 
     def _get_timestamp(self) -> str:
         """Get current ISO timestamp."""
-        from datetime import datetime, timezone
         return datetime.now(timezone.utc).isoformat()
+
+    def _build_deterministic_recall(self, memories: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Build grounded recall fields (income/co-applicant/date) for natural, factual opening lines."""
+        latest_income = None
+        latest_co_name = None
+        latest_co_income = None
+        latest_ts = None
+
+        for mem in memories:
+            m_type = str(mem.get("type", ""))
+            value = mem.get("value")
+            ts = mem.get("timestamp")
+
+            if ts and (latest_ts is None or str(ts) > str(latest_ts)):
+                latest_ts = ts
+
+            if m_type == "income" and value:
+                latest_income = {"value": str(value), "timestamp": ts}
+            elif m_type in {"co_applicant_name", "co_applicant"} and value:
+                latest_co_name = {"value": str(value), "timestamp": ts}
+            elif m_type in {"co_applicant_income", "co_income"} and value:
+                latest_co_income = {"value": str(value), "timestamp": ts}
+
+        recall = {
+            "latest_income": latest_income,
+            "co_applicant_name": latest_co_name,
+            "co_applicant_income": latest_co_income,
+            "last_discussed_at": latest_ts,
+            "last_discussed_day": None,
+        }
+
+        if latest_ts:
+            try:
+                norm = str(latest_ts)
+                if norm.endswith("+00:00Z"):
+                    norm = norm[:-1]
+                elif norm.endswith("Z"):
+                    norm = norm[:-1] + "+00:00"
+                dt = datetime.fromisoformat(norm)
+                recall["last_discussed_day"] = dt.strftime("%A")
+            except Exception:
+                pass
+
+        return recall
+
+    def _extract_preferred_language(self, memories: List[Dict[str, Any]]) -> str:
+        """Return latest customer language preference from stored facts."""
+        for mem in reversed(memories):
+            if str(mem.get("type")) == "preferred_language":
+                value = str(mem.get("value", "")).strip().lower()
+                if value in {"english", "hindi"}:
+                    return value
+        return "hindi"

@@ -8,6 +8,11 @@ def init_mem0(bank_id: str = "default") -> Memory:
     history_db_base = os.getenv("MEM0_HISTORY_DB_PATH", "./mem0_history")
     ollama_api = os.getenv("OLLAMA_API", "http://localhost:11434")
 
+    # Mem0's Ollama providers may read OLLAMA_HOST internally, so align it
+    # with the runtime API setting to avoid connection mismatches.
+    if not os.getenv("OLLAMA_HOST"):
+        os.environ["OLLAMA_HOST"] = ollama_api
+
     vector_db_path = os.path.join(vector_db_base, bank_id)
     history_db_path = os.path.join(history_db_base, bank_id, f"{bank_id}.db")
 

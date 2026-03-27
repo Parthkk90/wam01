@@ -51,7 +51,8 @@ class ConversationAgent:
         self.max_history_turns = 4  # 4 turns = 8 entries (customer + agent each)
     
     def respond(self, session_id: str, customer_id: str, agent_id: str,
-                customer_message: str, briefing: Dict) -> Dict:
+                customer_message: str, briefing: Dict,
+                preferred_language: Optional[str] = None) -> Dict:
         """
         Generate agent response to customer message.
         Detect income revisions and return facts to update.
@@ -89,7 +90,8 @@ class ConversationAgent:
                 customer_name=briefing.get("customer_id", "Customer"),
                 briefing_summary=briefing_summary,
                 conversation_history=conversation_history,
-                customer_message=customer_message
+                customer_message=customer_message,
+                preferred_language=preferred_language,
             )
             
             # Step 5: Call ollama
@@ -111,7 +113,12 @@ class ConversationAgent:
             response_text = response.json().get("response", "").strip()
             
             if not response_text:
-                return self._fallback_response(session_id, customer_message, briefing)
+                return self._fallback_response(
+                    session_id,
+                    customer_message,
+                    briefing,
+                    preferred_language=preferred_language,
+                )
             
             # Step 6: Detect income revision
             income_revised, new_income_value = self._detect_income_revision(
@@ -140,6 +147,7 @@ class ConversationAgent:
                             session_id=session_id,
                             customer_id=customer_id,
                             agent_id=agent_id,
+                            bank_id=os.getenv("BANK_ID", "cooperative_bank_01"),
                             facts=facts_to_update
                         )
                     except Exception as e:
@@ -172,7 +180,12 @@ class ConversationAgent:
         
         except Exception as e:
             logger.error(f"ConversationAgent.respond error: {e}")
-            return self._fallback_response(session_id, customer_message, briefing)
+            return self._fallback_response(
+                session_id,
+                customer_message,
+                briefing,
+                preferred_language=preferred_language,
+            )
     
     def _build_conversation_history(self, session_id: str) -> str:
         """Format last 4 turns as string."""
@@ -214,8 +227,21 @@ class ConversationAgent:
     def _build_conversation_prompt(self, agent_id: str, customer_name: str,
                                     briefing_summary: str,
                                     conversation_history: str,
-                                    customer_message: str) -> str:
+                                    customer_message: str,
+                                    preferred_language: Optional[str] = None) -> str:
         """Build the exact conversation prompt for phi4-mini."""
+        resolved_language = (preferred_language or self._detect_message_language(customer_message)).lower()
+        if resolved_language == "english":
+            language_rule = (
+                "- LANGUAGE RULE: Reply ONLY in English. "
+                "Do not switch to Hindi or Hinglish."
+            )
+        else:
+            language_rule = (
+                "- LANGUAGE RULE: Reply ONLY in Hindi/Hinglish in Latin script. "
+                "Do not switch to English-only mode."
+            )
+
         prompt = f"""You are Agent {agent_id}, a loan officer at a cooperative bank
 in Pune, India. You are speaking with {customer_name}.
 
@@ -229,7 +255,7 @@ CUSTOMER JUST SAID:
 "{customer_message}"
 
 Rules:
-- LANGUAGE RULE: Reply in the SAME language the customer used. If they wrote in English, reply in English. If they wrote in Hindi/Hinglish, reply in Hinglish. Do NOT switch languages.
+{language_rule}
 - NEVER ask for information already in your memory
 - If customer mentions a NEW income figure: acknowledge naturally
   e.g. "Achha, 62,000 ho gayi — yeh toh acchi baat hai Rajesh ji"
@@ -247,6 +273,33 @@ NEVER say:
 
 Your response:"""
         return prompt
+
+    def _detect_message_language(self, text: str) -> str:
+        """Return 'hindi' or 'english' using lightweight heuristics."""
+        if not text:
+            return "hindi"
+
+        if re.search(r"[\u0900-\u097F]", text):
+            return "hindi"
+
+        lowered = text.lower()
+        hindi_tokens = {
+            "mera", "meri", "mere", "hai", "hain", "nahi", "nahin", "kya",
+            "aap", "hum", "main", "kar", "karna", "loan", "ji", "pichle",
+            "baat", "income", "salary", "ghar", "patni", "wife",
+        }
+        english_tokens = {
+            "the", "is", "are", "my", "your", "please", "document", "salary",
+            "income", "loan", "amount", "eligible", "eligibility",
+        }
+
+        words = re.findall(r"[a-zA-Z]+", lowered)
+        if not words:
+            return "hindi"
+
+        hi_score = sum(1 for w in words if w in hindi_tokens)
+        en_score = sum(1 for w in words if w in english_tokens)
+        return "hindi" if hi_score >= en_score else "english"
     
     def _detect_income_revision(self, customer_message: str,
                                 briefing: Dict) -> tuple:
@@ -303,9 +356,11 @@ Your response:"""
         self.history.pop(session_id, None)
     
     def _fallback_response(self, session_id: str, customer_message: str = "",
-                           briefing: Dict = None) -> Dict:
+                           briefing: Dict = None,
+                           preferred_language: Optional[str] = None) -> Dict:
         """Context-aware fallback when ollama fails."""
         msg_lower = customer_message.lower() if customer_message else ""
+        lang = (preferred_language or self._detect_message_language(customer_message)).lower()
         facts = []
         if briefing:
             facts = (
@@ -319,7 +374,40 @@ Your response:"""
         )
 
         # Build context-aware response
-        if income_revised and new_income_value:
+        if lang == "english":
+            if income_revised and new_income_value:
+                response = (
+                    f"Understood, your monthly income is now {new_income_value}. "
+                    "That should improve eligibility slightly. Can you share your latest salary slip?"
+                )
+            elif any(w in msg_lower for w in ["document", "salary slip", "form 16", "payslip"]):
+                response = (
+                    "Sure. We will need the last 3 months' salary slips and Form 16. "
+                    "Do you have both ready?"
+                )
+            elif any(w in msg_lower for w in ["eligib", "loan", "amount", "lakh"]):
+                income = next((f["value"] for f in facts if f.get("type") == "income"), None)
+                if income:
+                    response = (
+                        f"Based on your income {income}, indicative eligibility is around 48 lakhs. "
+                        "Final value will be confirmed after document verification."
+                    )
+                else:
+                    response = (
+                        "We can estimate eligibility from income and existing EMI. "
+                        "Could you share your latest salary details?"
+                    )
+            elif any(w in msg_lower for w in ["property", "plot", "flat", "house"]):
+                response = (
+                    "For the property, we will need title documents and supporting land/property papers. "
+                    "Are these available with you?"
+                )
+            else:
+                response = (
+                    "Noted. We will proceed step by step with your home loan process. "
+                    "Anything else you want to add right now?"
+                )
+        elif income_revised and new_income_value:
             response = (
                 f"Achha, {new_income_value} ho gayi salary — yeh toh acchi baat hai! "
                 "Revised income ke saath eligibility thodi aur improve hogi. "
@@ -333,7 +421,6 @@ Your response:"""
         elif any(w in msg_lower for w in ["eligib", "kitna", "loan", "amount", "lakh"]):
             # Try to find income + emi from facts
             income = next((f["value"] for f in facts if f.get("type") == "income"), None)
-            emi = next((f["value"] for f in facts if "emi" in f.get("type", "")), None)
             if income:
                 response = (
                     f"Aapki income {income} ke hisaab se, indicative eligibility "

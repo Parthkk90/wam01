@@ -19,28 +19,32 @@ You have these notes from previous calls:
 
 Customer: {customer_name}
 Previous sessions: {session_count}
+Conversation context:
+{conversation_context}
+
 Key facts:
 {facts_summary}
 
 Write your opening sentence when you pick up the phone.
 
 Rules:
-- Sound like YOU personally remember — not like you read a file
+- Sound like YOU personally remember the CONVERSATION, not just facts
 - Use Hinglish naturally (mix Hindi and English like a Pune banker)
-- Reference ONE specific detail the customer told you
+- Reference what they ASKED FOR or DISCUSSED, not just data points
 - Mention time naturally ("last time", "pichle hafte", etc)
 - Ask ONE soft follow-up that shows you were paying attention
-- Maximum 40 words
+- Maximum 50 words
 - Do NOT say "our records show" or "as per our system"
-- Do NOT list multiple facts — pick the most relevant one
+- DO mention: loan type, amount, preferences if discussed
+- DO include: "I remember you mentioned..."
 
-Example of GOOD output:
-"Rajesh ji, namaskar! Aapne pichle baar Nashik wali property
-ka mention kiya tha — kya 7/12 extract ready ho gayi?"
+Example of GOOD output (if they discussed home loan):
+"Namaste Priya! Aapne pichle baar ₹100K ke home loan ke liye 
+puch tha tha — monthly installments prefer karte ho? Status dekhte hain?"
 
 Example of BAD output:
-"Hello, I can see from our records that your income is 55000
-and you have a co-applicant named Sunita."
+"Hello, I can see from our records that your income is 100000 
+and you're interested in a loan."
 
 Your opening sentence:
 """
@@ -57,7 +61,8 @@ class ConversationEngine:
         self, 
         customer_name: str, 
         facts: List[Dict],
-        session_count: int
+        session_count: int,
+        conversation_context: str = ""  # ← NEW PARAMETER
     ) -> str:
         """
         Generate natural opening statement for session start.
@@ -71,13 +76,17 @@ class ConversationEngine:
         # Build fact summary (pick top 1-2 facts)
         facts_summary = self._pick_relevant_facts(facts)
         
+        # Use conversation context if available, else use facts
+        context_to_use = conversation_context.strip() if conversation_context else facts_summary
+        
         prompt = BRIEFING_TO_SPEECH_PROMPT.format(
             customer_name=customer_name,
             session_count=session_count,
+            conversation_context=context_to_use,
             facts_summary=facts_summary
         )
         
-        result = self._call_ollama(prompt, max_tokens=50)
+        result = self._call_ollama(prompt, max_tokens=60)
         if result and len(result.strip()) > 10:
             return result
         
@@ -234,10 +243,11 @@ Output: (only the polished greeting)"""
         facts: List[Dict],
         flags: List[str],
         session_count: int,
+        conversation_context: str = "",  # ← NEW PARAMETER
     ) -> Dict[str, Any]:
         """Build complete conversational briefing dict."""
         # Use new Briefing-to-Speech prompt for opening statement
-        greeting = self.generate_opening_statement(customer_name, facts, session_count)
+        greeting = self.generate_opening_statement(customer_name, facts, session_count, conversation_context)
         context = self.summarize_facts(facts)
         next_step = self.generate_next_step(facts, flags)
 

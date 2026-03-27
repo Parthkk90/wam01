@@ -10,3 +10,4 @@ aiokafka>=0.10.0
 pytest==7.4.3
 pytest-asyncio==0.21.1
 pydantic==2.9.0
+chromadb

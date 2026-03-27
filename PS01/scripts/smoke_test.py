@@ -14,6 +14,8 @@ import json
 import time
 import asyncio
 import shutil
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +25,7 @@ load_dotenv()
 sys.path.insert(0, "/home/parth/ccode/wam0/PS01")
 
 results = {}
+API_TIMEOUT = int(os.getenv("SMOKE_API_TIMEOUT", "60"))
 
 
 def check_pass(name: str):
@@ -75,6 +78,7 @@ def print_summary():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 try:
     import urllib.request
+    from urllib.parse import urlparse
     
     # Test Ollama
     resp = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3)
@@ -87,14 +91,19 @@ try:
     
     # Test Redis
     import redis as redis_lib
-    r = redis_lib.Redis(host="localhost", port=6379, decode_responses=True)
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6380")
+    parsed_redis = urlparse(redis_url)
+    redis_host = parsed_redis.hostname or "localhost"
+    redis_port = parsed_redis.port or 6380
+    r = redis_lib.Redis(host=redis_host, port=redis_port, decode_responses=True)
     r.ping()
     
     # Test Redpanda
     from aiokafka import AIOKafkaProducer
     
     async def probe_redpanda():
-        p = AIOKafkaProducer(bootstrap_servers="localhost:9092")
+        brokers = os.getenv("REDPANDA_BROKERS", "localhost:9092")
+        p = AIOKafkaProducer(bootstrap_servers=brokers)
         await p.start()
         await p.stop()
     
@@ -192,36 +201,88 @@ except Exception as e:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHECK 5 — Mem0 add + search (real ChromaDB + Ollama)
+# CHECK 5 — Dynamic session lifecycle + recall via FastAPI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 try:
-    from src.infra.mem0_init import init_mem0
-    import time
-    
+    import requests
+
     start = time.time()
-    
-    # Use simpler paths
-    os.environ["MEM0_VECTOR_DB_PATH"] = "./test_chroma_add"
-    os.environ["MEM0_HISTORY_DB_PATH"] = "./test_mem0_add"
-    os.environ["OLLAMA_API"] = "http://localhost:11434"
-    
-    memory = init_mem0(bank_id="add_test")
-    
-    memory.add(
-        [{"role": "user", "content": "income is 55000 rupees monthly"}],
-        user_id="SMOKE_C001"
+
+    base_url = os.getenv("PS01_API_URL", "http://localhost:8000")
+    customer_id = f"SMOKE_C_{int(time.time())}"
+    agent_id = "SMOKE_AGENT"
+    income_value = "73000"
+
+    # Session 1: start
+    start_resp = requests.post(
+        f"{base_url}/session/start",
+        json={
+            "customer_id": customer_id,
+            "session_type": "home_loan_processing",
+            "agent_id": agent_id,
+            "consent_id": f"SMOKE_CONSENT_{customer_id}",
+        },
+        timeout=API_TIMEOUT,
     )
-    
-    results_search = memory.search("income", user_id="SMOKE_C001")
+    start_resp.raise_for_status()
+    start_payload = start_resp.json()
+    session_1 = start_payload.get("session_id")
+    assert session_1, "Session 1 start did not return session_id"
+
+    # Session 1: add a fact dynamically through API write path
+    add_fact_url = (
+        f"{base_url}/session/add-fact?"
+        + urllib.parse.urlencode(
+            {
+                "session_id": session_1,
+                "customer_id": customer_id,
+                "agent_id": agent_id,
+                "fact_type": "income",
+                "fact_value": income_value,
+            }
+        )
+    )
+    add_resp = requests.post(add_fact_url, timeout=API_TIMEOUT)
+    add_resp.raise_for_status()
+    add_payload = add_resp.json()
+    assert add_payload.get("wal_written") is True, "Fact not written to WAL"
+
+    # Session 1: end
+    end_resp = requests.post(
+        f"{base_url}/session/end",
+        json={"session_id": session_1},
+        timeout=API_TIMEOUT,
+    )
+    end_resp.raise_for_status()
+
+    # Session 2: start again with same customer/session key domain
+    start2_resp = requests.post(
+        f"{base_url}/session/start",
+        json={
+            "customer_id": customer_id,
+            "session_type": "home_loan_processing",
+            "agent_id": agent_id,
+            "consent_id": f"SMOKE_CONSENT2_{customer_id}",
+        },
+        timeout=API_TIMEOUT,
+    )
+    start2_resp.raise_for_status()
+    start2_payload = start2_resp.json()
+
+    # Validate dynamic recall from previous session data
+    briefing = start2_payload.get("briefing") or {}
+    all_facts = []
+    all_facts.extend(briefing.get("verified_facts", []))
+    all_facts.extend(briefing.get("unverified_facts", []))
+    all_facts_text = json.dumps(all_facts)
+    recall_hit = income_value in all_facts_text or income_value in json.dumps(start2_payload)
+
+    assert recall_hit, (
+        "Cross-session recall failed: second session did not include prior income fact"
+    )
+
     elapsed = time.time() - start
-    
-    assert len(results_search) > 0, "No results from memory search"
-    
-    # Cleanup
-    shutil.rmtree("./test_chroma_add", ignore_errors=True)
-    shutil.rmtree("./test_mem0_add", ignore_errors=True)
-    
-    print(f"  ✅ CHECK 5: Mem0 add + search: PASS (took {elapsed:.1f}s)")
+    print(f"  ✅ CHECK 5: Dynamic session recall: PASS (took {elapsed:.1f}s)")
     results["CHECK 5: Mem0 add + search"] = "PASS"
 except Exception as e:
     check_fail("CHECK 5: Mem0 add + search", str(e))
@@ -234,8 +295,13 @@ except Exception as e:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 try:
     import redis as redis_lib
+    from urllib.parse import urlparse
     
-    r = redis_lib.Redis(host="localhost", port=6379, decode_responses=True)
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6380")
+    parsed_redis = urlparse(redis_url)
+    redis_host = parsed_redis.hostname or "localhost"
+    redis_port = parsed_redis.port or 6380
+    r = redis_lib.Redis(host=redis_host, port=redis_port, decode_responses=True)
     r.set("smoke:test", "ps01_working", ex=60)
     val = r.get("smoke:test")
     
@@ -258,7 +324,8 @@ try:
     import json
     
     async def produce():
-        producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
+        brokers = os.getenv("REDPANDA_BROKERS", "localhost:9092")
+        producer = AIOKafkaProducer(bootstrap_servers=brokers)
         await producer.start()
         try:
             msg = json.dumps({"smoke_test": True, "fact": "income_55000"})

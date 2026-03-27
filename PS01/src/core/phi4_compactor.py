@@ -54,22 +54,66 @@ class Phi4Compactor:
             session_timestamp=session_timestamp
         )
 
-        response = ollama.chat(
-            model='phi4-mini',
-            messages=[{'role': 'user', 'content': prompt}],
-            stream=False
-        )
-
-        summary_text = response['message']['content']
+        summary_text = ""
         try:
+            response = ollama.chat(
+                model='phi4-mini',
+                messages=[{'role': 'user', 'content': prompt}],
+                stream=False
+            )
+            summary_text = response['message']['content']
             summary_json = json.loads(summary_text)
-        except json.JSONDecodeError:
-            # Phi-4-Mini might not output pure JSON
-            summary_json = {"raw": summary_text, "parsed": False}
+            summary_json["parsed"] = True
+        except Exception:
+            summary_json = self._deterministic_compact(
+                facts=facts,
+                customer_id=customer_id,
+                session_timestamp=session_timestamp,
+            )
+            summary_json["parsed"] = False
+            summary_json["raw"] = summary_text
 
         # Write summary to Redis cache if available
         if redis_cache is not None and customer_id:
             summary_json_str = json.dumps(summary_json)
-            await redis_cache.set_summary(customer_id, summary_json_str)
+            if hasattr(redis_cache, "set_summary"):
+                await redis_cache.set_summary(customer_id, summary_json_str)
+            else:
+                await redis_cache.set(f"summary:{customer_id}", summary_json_str, ex=14400)
 
         return summary_json
+
+    def _deterministic_compact(
+        self,
+        facts: List[Dict],
+        customer_id: str,
+        session_timestamp: str,
+    ) -> Dict[str, Any]:
+        """Deterministic fallback compaction when model output is invalid/unavailable."""
+        latest_by_type: Dict[str, Dict[str, Any]] = {}
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            f_type = str(fact.get("type", "unknown"))
+            latest_by_type[f_type] = {
+                "type": f_type,
+                "value": fact.get("value"),
+                "verified": bool(fact.get("verified", False)),
+                "source": fact.get("source", "unknown"),
+            }
+
+        compacted_facts = list(latest_by_type.values())
+        verified_count = sum(1 for f in compacted_facts if f.get("verified"))
+        unverified_count = len(compacted_facts) - verified_count
+
+        summary_lines = [f"{f['type']}: {f.get('value')}" for f in compacted_facts[:6]]
+        summary_text = "; ".join(summary_lines) if summary_lines else "No facts captured"
+
+        return {
+            "customer_id": customer_id or "unknown",
+            "as_of_session": session_timestamp,
+            "facts": compacted_facts,
+            "verified_count": verified_count,
+            "unverified_count": unverified_count,
+            "summary_text": summary_text,
+        }

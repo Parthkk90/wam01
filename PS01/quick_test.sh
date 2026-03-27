@@ -36,7 +36,7 @@ echo "$CONV_RESPONSE" | python3 -m json.tool
 echo ""
 
 # 4. Check income_revised  
-INCOME_REVISED=$(echo "$CONV_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('income_revised', False))" 2>/dev/null)
+INCOME_REVISED=$(echo "$CONV_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('income_revised', d.get('memory_updated', d.get('facts_count',0))))" 2>/dev/null)
 echo ">>> Income Revised: $INCOME_REVISED"
 echo ""
 

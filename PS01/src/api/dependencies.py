@@ -1,5 +1,10 @@
 """FastAPI dependency injection for core services."""
 
+import asyncio
+import logging
+import os
+from pathlib import Path
+
 from src.core.wal import WALLogger
 from src.core.mem0_bridge import Mem0Bridge
 from src.core.cbs_preseeder import CBSPreseeder
@@ -15,9 +20,13 @@ from src.core.branch_lock_manager import BranchLockManager
 from src.core.tenant_registry import TenantRegistry
 from src.api.middleware import ConsentDB
 from src.preprocessing.tokenizer import BankingTokenizer
+from src.infra.redpanda_producer import RedpandaProducer
+from src.infra.redpanda_consumer import RedpandaConsumer
 import redis.asyncio as redis
 from typing import Optional, Annotated
 from fastapi import Depends
+
+logger = logging.getLogger(__name__)
 
 
 # Singleton instances (in production, use proper DI container)
@@ -37,13 +46,23 @@ _demo_seeder: Optional[DemoSeeder] = None
 _evaluation_harness: Optional[EvaluationHarness] = None
 _branch_lock_manager: Optional[BranchLockManager] = None
 _tenant_registry: Optional[TenantRegistry] = None
+_redpanda_producer: Optional[RedpandaProducer] = None
+_redpanda_consumer: Optional[RedpandaConsumer] = None
+
+
+def _parse_redpanda_brokers() -> list[str]:
+    brokers_raw = os.getenv("REDPANDA_BROKERS", "localhost:9092")
+    return [b.strip() for b in brokers_raw.split(",") if b.strip()]
 
 
 async def get_wal_logger() -> WALLogger:
     """Get WALLogger instance."""
     global _wal_logger
     if _wal_logger is None:
-        _wal_logger = WALLogger(wal_path="/tmp/ps01_wal.jsonl")
+        project_root = Path(__file__).resolve().parents[2]
+        default_wal = project_root / "data" / "wal" / "ps01_wal.jsonl"
+        wal_path = os.getenv("WAL_PATH", str(default_wal))
+        _wal_logger = WALLogger(wal_path=wal_path)
     return _wal_logger
 
 
@@ -85,11 +104,51 @@ async def get_redis_cache() -> redis.Redis:
     global _redis_cache
     if _redis_cache is None:
         try:
-            _redis_cache = await redis.from_url("redis://localhost:6379")
+            _redis_cache = await redis.from_url(
+                os.getenv("REDIS_URL", "redis://localhost:6380")
+            )
         except Exception:
             # If Redis is not available, return None (graceful degradation)
             return None
     return _redis_cache
+
+
+async def get_redpanda_producer() -> Optional[RedpandaProducer]:
+    """Get Redpanda producer instance (graceful degradation when broker unavailable)."""
+    global _redpanda_producer
+
+    if _redpanda_producer is None:
+        bank_id = os.getenv("BANK_ID", "cooperative_bank_01")
+        _redpanda_producer = RedpandaProducer(
+            brokers=_parse_redpanda_brokers(),
+            bank_id=bank_id,
+        )
+
+    if getattr(_redpanda_producer, "_producer", None) is None:
+        connect_timeout = float(os.getenv("REDPANDA_CONNECT_TIMEOUT", "2"))
+        try:
+            await asyncio.wait_for(_redpanda_producer.connect(), timeout=connect_timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Redpanda producer unavailable: %s", exc)
+            return None
+
+    return _redpanda_producer
+
+
+async def get_redpanda_consumer() -> RedpandaConsumer:
+    """Get Redpanda consumer instance for background orchestration."""
+    global _redpanda_consumer
+
+    if _redpanda_consumer is None:
+        bank_id = os.getenv("BANK_ID", "cooperative_bank_01")
+        group_id = os.getenv("REDPANDA_GROUP_ID", "central-processor")
+        _redpanda_consumer = RedpandaConsumer(
+            brokers=_parse_redpanda_brokers(),
+            bank_id=bank_id,
+            group_id=group_id,
+        )
+
+    return _redpanda_consumer
 
 
 async def get_briefing_builder(
