@@ -1,0 +1,1 @@
+{"session_id": "TEST_S001", "timestamp": "2026-03-26T21:04:02.495251+00:00Z", "customer_id": "TEST_C001", "agent_id": "TEST_AGT", "bank_id": "test_bank", "facts": [{"type": "income", "value": "62000", "verified": false, "source": "customer_verbal_revised"}], "idempotency_key": "3b1e5383-feca-44ab-a531-d9f91616c887", "shipped": false}

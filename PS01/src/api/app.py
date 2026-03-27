@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.middleware import ConsentMiddleware
 from src.api.session import router as session_router
+from src.api.session import memory_router as memory_router
 from src.api.feedback import router as feedback_router
 from src.api.demo import router as demo_router
 from src.api.branch import router as branch_router
@@ -37,6 +38,7 @@ app.add_middleware(ConsentMiddleware)
 
 # Register routers
 app.include_router(session_router)
+app.include_router(memory_router)
 app.include_router(feedback_router)
 app.include_router(demo_router)
 app.include_router(branch_router)

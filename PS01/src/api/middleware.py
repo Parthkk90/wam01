@@ -110,6 +110,7 @@ class ConsentMiddleware(BaseHTTPMiddleware):
         "/docs",
         "/openapi.json",
         "/redoc",
+        "/session/consent/record",  # Allow consent recording without prior consent
     }
     
     async def dispatch(self, request: Request, call_next):

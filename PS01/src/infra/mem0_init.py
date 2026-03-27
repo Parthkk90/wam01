@@ -19,7 +19,9 @@ def init_mem0(bank_id: str = "default") -> Memory:
             "provider": "ollama",
             "config": {
                 "model": "phi4-mini",
-                "ollama_base_url": ollama_api
+                "ollama_base_url": ollama_api,
+                "temperature": 0.7,
+                "top_p": 0.9
             }
         },
         "embedder": {
@@ -32,7 +34,7 @@ def init_mem0(bank_id: str = "default") -> Memory:
         "vector_store": {
             "provider": "chroma",
             "config": {
-                "collection_name": f"mem0_{bank_id}",
+                "collection_name": f"ps01_{bank_id}",
                 "path": vector_db_path
             }
         },

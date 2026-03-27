@@ -9,7 +9,14 @@ Includes conversational output via ConversationEngine.
 
 from typing import Dict, Any, Optional, List
 import json
+import os
+import logging
 from .conversation_engine import ConversationEngine
+
+# Banking ID for composite user_id
+BANK_ID = os.getenv("BANK_ID", "cooperative_bank_01")
+
+logger = logging.getLogger(__name__)
 
 
 class BriefingBuilder:
@@ -20,7 +27,7 @@ class BriefingBuilder:
     recommended next step, and pending items.
     """
 
-    def __init__(self, memory: Optional[Any] = None, redis_cache: Optional[Any] = None, health_checker: Optional[Any] = None):
+    def __init__(self, memory: Optional[Any] = None, redis_cache: Optional[Any] = None, health_checker: Optional[Any] = None, wal_logger: Optional[Any] = None):
         """
         Initialize briefing builder.
 
@@ -28,10 +35,12 @@ class BriefingBuilder:
             memory: mem0 Memory instance for searching facts
             redis_cache: Redis/aioredis instance for caching
             health_checker: MemoryHealthChecker instance for data quality assessment
+            wal_logger: WALLogger instance for reading facts from WAL (primary source of truth)
         """
         self.memory = memory
         self.redis_cache = redis_cache
         self.health_checker = health_checker
+        self.wal_logger = wal_logger
 
     async def build(self, customer_id: str) -> Dict[str, Any]:
         """
@@ -79,21 +88,50 @@ class BriefingBuilder:
 
     async def _assemble_briefing(self, customer_id: str) -> Dict[str, Any]:
         """
-        Assemble briefing from mem0 search results.
-
-        If no memories found, return default briefing with
-        recommended_next_step = "Collect customer information..."
+        Assemble briefing from WAL entries (source of truth).
+        
+        **OPTIMIZATION**: WAL is the authoritative source for all facts.
+        Skip Mem0 layer (which requires LLM) - just read facts directly from WAL.
+        This is faster and avoids RAM issues with Phi-4-Mini in memory.add().
         """
         memories = []
 
-        # Try to search memories
-        if self.memory:
+        # **CRITICAL FIX**: Read facts directly from WAL instead of Mem0
+        # WAL contains all facts written during previous sessions (via /session/end)
+        if hasattr(self, 'wal_logger') and self.wal_logger:
             try:
+                # Get ALL entries for this customer (shipped + unshipped)
+                all_entries = self.wal_logger.get_all_for_customer(customer_id)
+                customer_facts = []
+
+                for entry in all_entries:
+                    facts = entry.get("facts", [])
+                    customer_facts.extend(facts)
+                
+                # Convert to memory format
+                for fact in customer_facts:
+                    if isinstance(fact, dict):
+                        memories.append({
+                            "id": f"{customer_id}_{fact.get('type')}",
+                            "content": f"{fact.get('type')}: {fact.get('value')}",
+                            "type": fact.get("type"),
+                            "value": fact.get("value"),
+                            "verified": fact.get("verified", False)
+                        })
+                logger.info(f"Retrieved {len(memories)} facts from WAL for {customer_id}")
+            except Exception as e:
+                logger.debug(f"WAL retrieval failed: {e}")
+                memories = []
+        
+        # Fallback to Mem0 if WAL fails (graceful degradation)
+        if not memories and self.memory:
+            try:
+                composite_user_id = f"{BANK_ID}::{customer_id}"
                 memories = self.memory.search(
-                    query="loan application customer profile",
-                    user_id=customer_id
+                    query="customer income co-applicant property verification facts",
+                    user_id=composite_user_id
                 )
-            except Exception:
+            except Exception as e:
                 memories = []
 
         # Extract facts from memories
@@ -102,8 +140,33 @@ class BriefingBuilder:
         pending_review = []
 
         for mem in memories:
+            # Parse content to extract type and value
+            # Expected formats: "type: value" or just "content text"
+            fact_type = "unknown"
+            fact_value = mem.get("content", "")
+            
+            content_lower = mem.get("content", "").lower()
+            if "income:" in content_lower or "salary:" in content_lower:
+                fact_type = "income"
+                # Extract value after colon
+                parts = mem.get("content", "").split(":")
+                if len(parts) > 1:
+                    fact_value = parts[-1].strip()
+            elif "co.applicant" in content_lower or "co-applicant" in content_lower or "sunita" in content_lower:
+                fact_type = "co_applicant_name"
+                parts = mem.get("content", "").split(":")
+                fact_value = parts[-1].strip() if len(parts) > 1 else mem.get("content", "")
+            elif "property" in content_lower or "location" in content_lower:
+                fact_type = "property_location"
+                parts = mem.get("content", "").split(":")
+                fact_value = parts[-1].strip() if len(parts) > 1 else mem.get("content", "")
+            elif "document" in content_lower or "payslip" in content_lower or "form 16" in content_lower:
+                fact_type = "document_provided"
+            
             fact = {
                 "id": mem.get("id", ""),
+                "type": fact_type,
+                "value": fact_value,
                 "content": mem.get("content", ""),
                 "verified": mem.get("verified", False)
             }
@@ -128,7 +191,7 @@ class BriefingBuilder:
         briefing = {
             "customer_id": customer_id,
             "customer_name": self._extract_customer_name(memories),
-            "session_count": len([m for m in memories if "session" in m.get("content", "").lower()]),
+            "session_count": len(memories) if len(memories) > 0 else 0,  # If we have facts, it's a returning customer (session_count >= 1)
             "verified_facts": verified_facts,
             "unverified_facts": unverified_facts,
             "pending_review": pending_review,

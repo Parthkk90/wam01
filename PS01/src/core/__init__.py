@@ -8,4 +8,5 @@ from .pipeline_orchestrator import PipelineOrchestrator
 from .cbs_preseeder import CBSPreseeder
 from .briefing_builder import BriefingBuilder
 from .voice_bot import VoiceBot
+from .conversation_agent import ConversationAgent
 from .evaluation_harness import EvaluationHarness

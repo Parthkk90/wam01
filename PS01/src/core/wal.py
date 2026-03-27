@@ -75,6 +75,21 @@ class WALLogger:
                     unshipped.append(entry)
         return unshipped
 
+    def get_all_for_customer(self, customer_id: str) -> List[Dict]:
+        """Return ALL WAL entries (shipped or not) for a specific customer."""
+        if not self.wal_path.exists():
+            return []
+        entries = []
+        with open(self.wal_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if entry.get("customer_id") == customer_id:
+                    entries.append(entry)
+        return entries
+
     def mark_shipped(self, idempotency_key: str) -> None:
         """Find all entries with the given idempotency_key and set shipped=True."""
         if not self.wal_path.exists():

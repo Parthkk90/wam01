@@ -4,17 +4,32 @@ from typing import List, Dict, Any, Optional
 from ..infra import RedisCache
 
 COMPACTOR_PROMPT_TEMPLATE = """
-You are a financial memory compactor for banking loan officers.
+You are a memory compactor for a banking system.
+You receive raw facts from a loan officer session.
+Your job: compress them into a minimal fact sheet for efficient storage.
 
-Given these facts from a loan session, produce a consolidated summary:
-- Remove contradictions (e.g., income stated as both 55K and 60K)
-- Flag verified vs. derived facts
-- Output JSON only, no explanation
+Rules:
+- If income appears twice, keep only the latest value
+- Mark verified=true only if source is "document_parsed"
+- Merge co-applicant facts into one record
+- Remove contradictions by keeping the most recent fact
+- Output ONLY valid JSON, no explanation, no markdown
 
-Facts:
+Input facts:
 {facts_json}
 
-Output JSON (facts_consolidated, verified_count, derived_count):
+Output format (ONLY JSON, nothing else):
+{{
+  "customer_id": "{customer_id}",
+  "as_of_session": "{session_timestamp}",
+  "facts": [
+    {{"type": "income", "value": "55000", "verified": false, "source": "customer_verbal"}},
+    {{"type": "co_applicant_name", "value": "Sunita", "verified": false, "source": "customer_verbal"}},
+    {{"type": "co_applicant_income", "value": "30000", "verified": false, "source": "customer_verbal"}}
+  ],
+  "verified_count": 0,
+  "unverified_count": 3
+}}
 """
 
 
@@ -30,13 +45,17 @@ class Phi4Compactor:
         customer_id: str = "",
     ) -> Dict[str, Any]:
         """Compactor prompt to Phi-4-Mini"""
+        from datetime import datetime, timezone
+        session_timestamp = datetime.now(timezone.utc).isoformat()
+        
         prompt = COMPACTOR_PROMPT_TEMPLATE.format(
-            facts_json=json.dumps(facts, indent=2)
+            facts_json=json.dumps(facts, indent=2),
+            customer_id=customer_id or "unknown",
+            session_timestamp=session_timestamp
         )
 
         response = ollama.chat(
             model='phi4-mini',
-            base_url=self.ollama_api,
             messages=[{'role': 'user', 'content': prompt}],
             stream=False
         )

@@ -4,6 +4,8 @@ from src.core.wal import WALLogger
 from src.core.mem0_bridge import Mem0Bridge
 from src.core.cbs_preseeder import CBSPreseeder
 from src.core.briefing_builder import BriefingBuilder
+from src.core.briefing_speech import BriefingSpeechBuilder
+from src.core.conversation_agent import ConversationAgent
 from src.core.feedback_processor import FeedbackProcessor
 from src.core.memory_timeline import MemoryTimeline
 from src.core.memory_health import MemoryHealthChecker
@@ -25,6 +27,8 @@ _cbs_preseeder: Optional[CBSPreseeder] = None
 _consent_db: Optional[ConsentDB] = None
 _redis_cache: Optional[redis.Redis] = None
 _briefing_builder: Optional[BriefingBuilder] = None
+_briefing_speech_builder: Optional[BriefingSpeechBuilder] = None
+_conversation_agent: Optional[ConversationAgent] = None
 _tokenizer: Optional[BankingTokenizer] = None
 _feedback_processor: Optional[FeedbackProcessor] = None
 _memory_timeline: Optional[MemoryTimeline] = None
@@ -90,14 +94,16 @@ async def get_redis_cache() -> redis.Redis:
 
 async def get_briefing_builder(
     mem0_bridge: Annotated[Mem0Bridge, Depends(get_mem0_bridge)],
-    redis_cache: Annotated[Optional[redis.Redis], Depends(get_redis_cache)]
+    redis_cache: Annotated[Optional[redis.Redis], Depends(get_redis_cache)],
+    wal_logger: Annotated[WALLogger, Depends(get_wal_logger)]
 ) -> BriefingBuilder:
     """Get BriefingBuilder instance."""
     global _briefing_builder
     if _briefing_builder is None:
         mem0 = mem0_bridge or await get_mem0_bridge()
         cache = redis_cache or await get_redis_cache()
-        _briefing_builder = BriefingBuilder(memory=mem0, redis_cache=cache)
+        wal = wal_logger or await get_wal_logger()
+        _briefing_builder = BriefingBuilder(memory=mem0, redis_cache=cache, wal_logger=wal)
     return _briefing_builder
 
 
@@ -195,3 +201,22 @@ async def get_tenant_registry(
         r = redis or await get_redis_cache()
         _tenant_registry = TenantRegistry(r)
     return _tenant_registry
+
+
+async def get_briefing_speech_builder() -> BriefingSpeechBuilder:
+    """Get BriefingSpeechBuilder instance (reads OLLAMA_API from env)."""
+    global _briefing_speech_builder
+    if _briefing_speech_builder is None:
+        _briefing_speech_builder = BriefingSpeechBuilder()
+    return _briefing_speech_builder
+
+
+async def get_conversation_agent(
+    wal: Annotated[WALLogger, Depends(get_wal_logger)],
+    mem0: Annotated[Mem0Bridge, Depends(get_mem0_bridge)]
+) -> ConversationAgent:
+    """Get ConversationAgent instance (injects WAL and Mem0 for fact updates)."""
+    global _conversation_agent
+    if _conversation_agent is None:
+        _conversation_agent = ConversationAgent(wal_logger=wal, mem0_bridge=mem0)
+    return _conversation_agent

@@ -12,6 +12,39 @@ from .conversation_templates import fill_template, get_fact_summary_template
 logger = logging.getLogger(__name__)
 OLLAMA_TIMEOUT = 2  # Reduced from 10s for faster test feedback
 
+BRIEFING_TO_SPEECH_PROMPT = """
+You are a cooperative bank loan officer in Pune, India.
+You are calling a customer you have spoken to before.
+You have these notes from previous calls:
+
+Customer: {customer_name}
+Previous sessions: {session_count}
+Key facts:
+{facts_summary}
+
+Write your opening sentence when you pick up the phone.
+
+Rules:
+- Sound like YOU personally remember — not like you read a file
+- Use Hinglish naturally (mix Hindi and English like a Pune banker)
+- Reference ONE specific detail the customer told you
+- Mention time naturally ("last time", "pichle hafte", etc)
+- Ask ONE soft follow-up that shows you were paying attention
+- Maximum 40 words
+- Do NOT say "our records show" or "as per our system"
+- Do NOT list multiple facts — pick the most relevant one
+
+Example of GOOD output:
+"Rajesh ji, namaskar! Aapne pichle baar Nashik wali property
+ka mention kiya tha — kya 7/12 extract ready ho gayi?"
+
+Example of BAD output:
+"Hello, I can see from our records that your income is 55000
+and you have a co-applicant named Sunita."
+
+Your opening sentence:
+"""
+
 
 class ConversationEngine:
     """Generate conversational responses using Ollama phi4-mini."""
@@ -20,24 +53,81 @@ class ConversationEngine:
         """Initialize engine with Ollama endpoint."""
         self.ollama_api = ollama_api
 
+    def generate_opening_statement(
+        self, 
+        customer_name: str, 
+        facts: List[Dict],
+        session_count: int
+    ) -> str:
+        """
+        Generate natural opening statement for session start.
+        Uses Briefing-to-Speech prompt — sounds like agent remembers customer.
+        Fallback to simple template if Ollama unavailable.
+        """
+        if session_count == 0:
+            # First time — use generic greeting
+            return fill_template("greeting_new")
+        
+        # Build fact summary (pick top 1-2 facts)
+        facts_summary = self._pick_relevant_facts(facts)
+        
+        prompt = BRIEFING_TO_SPEECH_PROMPT.format(
+            customer_name=customer_name,
+            session_count=session_count,
+            facts_summary=facts_summary
+        )
+        
+        result = self._call_ollama(prompt, max_tokens=50)
+        if result and len(result.strip()) > 10:
+            return result
+        
+        # Fallback to template-based greeting
+        if session_count >= 2:
+            return fill_template("greeting_repeat", name=customer_name)
+        return fill_template("greeting_returning", name=customer_name)
+
+    def _pick_relevant_facts(self, facts: List[Dict]) -> str:
+        """Pick top 1-2 most relevant facts for opening statement."""
+        relevant = []
+        
+        # Priority: property, then income, then co-applicant; verified first, then unverified
+        for priority_type in ["property_location", "income", "co_applicant_name"]:
+            for fact in facts:
+                if fact.get("type") == priority_type:
+                    relevant.append(f"- {fact.get('type').replace('_', ' ')}: {fact.get('value')}")
+                    if len(relevant) >= 2:
+                        break
+            if len(relevant) >= 2:
+                break
+
+        # If still empty, take any 2 facts
+        if not relevant:
+            for fact in facts[:2]:
+                val = fact.get("value") or fact.get("content", "")
+                if val:
+                    relevant.append(f"- {val}")
+
+        return "\n".join(relevant) if relevant else "Previous application in progress"
+
     def _call_ollama(self, prompt: str, max_tokens: int = 150) -> Optional[str]:
         """
-        Call phi4-mini safely with timeout and error handling.
+        Call phi4-mini (3.8B model) for high-quality Hindi/Hinglish responses.
         Returns None on failure (will trigger fallback).
-        Skips if endpoint appears to be mock/local unavailable.
         """
-        # Quick fail for localhost:11434 if it's not responding fast
-        # This helps tests fail fast instead of waiting for timeouts
         try:
             response = requests.post(
                 f"{self.ollama_api}/api/generate",
                 json={
-                    "model": "phi4-mini",
+                    "model": "phi4-mini",  # Full 3.8B model - optimized for Indian languages
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"num_predict": max_tokens, "temperature": 0.3},
+                    "options": {
+                        "num_predict": max_tokens,
+                        "temperature": 0.3,
+                        "num_ctx": 256  # Phi4-mini standard context window
+                    },
                 },
-                timeout=1.5,  # Even faster timeout for quick fallback
+                timeout=1.5,  # Phi4-mini response time
             )
             response.raise_for_status()
             return response.json().get("response", "").strip()
@@ -146,7 +236,8 @@ Output: (only the polished greeting)"""
         session_count: int,
     ) -> Dict[str, Any]:
         """Build complete conversational briefing dict."""
-        greeting = self.generate_greeting(customer_name, facts, session_count)
+        # Use new Briefing-to-Speech prompt for opening statement
+        greeting = self.generate_opening_statement(customer_name, facts, session_count)
         context = self.summarize_facts(facts)
         next_step = self.generate_next_step(facts, flags)
 

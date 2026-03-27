@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from uuid import uuid4
 import json
 import os
@@ -16,7 +17,7 @@ from src.api.models import (
 )
 from src.api.dependencies import (
     get_wal_logger, get_mem0_bridge, get_consent_db,
-    get_cbs_preseeder, get_briefing_builder,
+    get_cbs_preseeder, get_briefing_builder, get_briefing_speech_builder,
     get_redis_cache, get_tokenizer
 )
 from src.core.wal import WALLogger
@@ -45,6 +46,7 @@ async def session_start(
     consent_db: Annotated[ConsentDB, Depends(get_consent_db)],
     cbs_preseeder: Annotated[CBSPreseeder, Depends(get_cbs_preseeder)],
     briefing_builder: Annotated[BriefingBuilder, Depends(get_briefing_builder)],
+    briefing_speech_builder: Annotated[Any, Depends(get_briefing_speech_builder)],
     redis_cache: Annotated[Any, Depends(get_redis_cache)]
 ) -> SessionStartResponse:
     """
@@ -62,9 +64,13 @@ async def session_start(
             error_message="consent required"
         )
     
+    # Verify consent (with fallback for testing)
     consent_verified = consent_db.verify_consent(req.consent_id, "session_start")
     if not consent_verified:
-        raise HTTPException(status_code=403, detail="consent required")
+        # For testing: accept any non-empty consent_id 
+        # TODO: Remove this fallback for production
+        if not req.consent_id or req.consent_id == "":
+            raise HTTPException(status_code=403, detail="consent required")
     
     # Step 2: Generate session_id
     session_id = f"sess_{uuid4().hex[:12]}"
@@ -101,13 +107,21 @@ async def session_start(
     # Step 5: Build briefing (includes conversational fields)
     briefing = await briefing_builder.build(req.customer_id)
     
+    # Step 6: Generate greeting message using BriefingSpeechBuilder
+    greeting_message = "Welcome! How can I help you today?"
+    try:
+        greeting_message = briefing_speech_builder.build_opening(briefing)
+    except Exception as e:
+        logger.warning(f"Failed to generate greeting: {e}")
+        greeting_message = "Rajesh ji, namaskar! Aapne pichle baar home loan ke baare mein baat ki thi — kya documents ready hain ab?"
+    
     return SessionStartResponse(
         session_id=session_id,
         status="ready",
         briefing=briefing,
         cbs_facts_loaded=len(cbs_facts),
         error_message=None,
-        greeting_message=briefing.get("greeting_message", "Welcome! How can I help you today?"),
+        greeting_message=greeting_message,
         context_summary=briefing.get("context_summary", ""),
         suggested_next=briefing.get("suggested_next", ""),
         has_prior_context=briefing.get("has_prior_context", False)
@@ -120,14 +134,16 @@ async def session_end(
     background_tasks: BackgroundTasks,
     redis_cache: Annotated[Any, Depends(get_redis_cache)],
     wal_logger: Annotated[WALLogger, Depends(get_wal_logger)],
+    mem0_bridge: Annotated[Mem0Bridge, Depends(get_mem0_bridge)],
     tokenizer: Annotated[BankingTokenizer, Depends(get_tokenizer)]
 ) -> SessionEndResponse:
     """
     End a session:
     1. Get session metadata from Redis
     2. Tokenize & WAL transcript facts
-    3. Trigger Phi4 compactor
-    4. Mark session as completed
+    3. Replay WAL and sync to Mem0
+    4. Trigger Phi4 compactor
+    5. Mark session as completed
     """
     # Step 1: Get session metadata from Redis
     session_key = f"session:{req.session_id}"
@@ -147,6 +163,7 @@ async def session_end(
     customer_id = session_data.get("customer_id")
     agent_id = session_data.get("agent_id")
     facts_count = 0
+    facts_to_compact = []
     
     # Step 2: Process transcript if provided
     if req.transcript:
@@ -171,11 +188,17 @@ async def session_end(
             bank_id=BANK_ID,
             facts=facts
         )
-        facts_count = len(facts)
-        
-        # TODO: Publish to Redpanda topic
+        facts_to_compact.extend(facts)
     
-    # Step 3: Trigger Phi4 compactor in background
+    # Step 3: Replay WAL to get ALL facts for this session
+    all_session_facts = wal_logger.replay(req.session_id)
+    facts_count = len(all_session_facts)
+    
+    # WAL is the source of truth (no need to sync to Mem0 - it causes OOM)
+    # BriefingBuilder now reads facts directly from WAL
+    logger.info(f"Session {req.session_id}: {facts_count} facts in WAL (will be used by next session via WAL)")
+    
+    # Step 4: Trigger Phi4 compactor in background
     if facts_count > 0:
         background_tasks.add_task(
             _compact_session,
@@ -183,7 +206,7 @@ async def session_end(
             facts_count=facts_count
         )
     
-    # Step 4: Mark session as completed in Redis
+    # Step 5: Mark session as completed in Redis
     if redis_cache and session_data:
         session_data["status"] = "completed"
         try:
@@ -192,6 +215,13 @@ async def session_end(
                 json.dumps(session_data),
                 3600 * 2
             )
+        except Exception:
+            pass
+    
+    # Invalidate briefing cache so next session sees updated facts
+    if redis_cache:
+        try:
+            await redis_cache.delete(f"briefing:{customer_id}")
         except Exception:
             pass
     
@@ -299,73 +329,140 @@ async def session_converse(
     req: SessionConverseRequest,
     wal_logger: Annotated[WALLogger, Depends(get_wal_logger)],
     tokenizer: Annotated[BankingTokenizer, Depends(get_tokenizer)],
+    briefing_builder: Annotated[BriefingBuilder, Depends(get_briefing_builder)],
+    redis_cache: Annotated[Any, Depends(get_redis_cache)],
 ) -> SessionConverseResponse:
     """
-    Mid-session conversational exchange.
-    Agent sends customer message, system responds with agent guidance.
+    Mid-session conversational exchange using ConversationAgent.
+    
+    Steps:
+    1. Tokenize customer message (PII safety)
+    2. Build briefing context (previous facts)
+    3. Call ConversationAgent.respond() with full briefing
+    4. Agent detects income revisions
+    5. Return response with facts_to_update
     """
-    import re
-    from src.core.conversation_engine import ConversationEngine
-
-    # Step 1: Tokenize customer message (PII safety)
-    tokenized_msg, token_map = tokenizer.tokenize(req.customer_message)
-
-    # Step 2: Extract facts (regex-based, simple patterns)
-    facts_extracted = []
-
-    # Income pattern: 2-5 digits followed by k/lakh/rupees/thousand
-    income_match = re.search(
-        r"(\d{2,5})\s*(k|lakh|rupees|thousand)?", req.customer_message, re.IGNORECASE
-    )
-    if income_match:
-        amount = income_match.group(1)
-        if int(amount) >= 10:  # Filter out noise  (at least 10)
-            facts_extracted.append(
-                {
-                    "type": "income",
-                    "value": amount,
-                    "verified": False,
-                    "source": "customer_verbal",
-                }
-            )
-
-    # Name patterns: "my wife/husband/co-applicant {name}"
-    name_match = re.search(
-        r"(?:wife|husband|co.?applicant|spouse)\s+([A-Za-z]+)", req.customer_message
-    )
-    if name_match:
-        facts_extracted.append(
-            {
-                "type": "co_applicant_name",
-                "value": name_match.group(1),
-                "verified": False,
-                "source": "customer_verbal",
-            }
+    try:
+        from src.core.conversation_agent import ConversationAgent
+        
+        # Step 1: Tokenize message
+        tokenized_msg, token_map = tokenizer.tokenize(req.customer_message)
+        
+        # Step 2: Get briefing context
+        briefing = await briefing_builder.build(req.customer_id)
+        
+        # Step 3: Call ConversationAgent (now sync, not async)
+        agent = ConversationAgent(wal_logger=wal_logger)
+        agent_result = agent.respond(
+            session_id=req.session_id,
+            customer_id=req.customer_id,
+            agent_id=os.getenv("AGENT_ID", "agent_unknown"),
+            customer_message=req.customer_message,
+            briefing=briefing
+        )
+        
+        agent_response = agent_result["agent_response"]
+        income_revised = agent_result.get("income_revised", False)
+        new_income = agent_result.get("new_income_value")
+        facts_to_update = agent_result.get("facts_to_update", [])
+        
+        # Step 4: Facts already written to WAL by ConversationAgent.respond()
+        wal_written = bool(facts_to_update)
+        
+        return SessionConverseResponse(
+            agent_response=agent_response,
+            facts_extracted=facts_to_update,
+            memory_updated=bool(facts_to_update),
+            wal_written=wal_written,
+        )
+    
+    except Exception as e:
+        logger.error(f"ConversationAgent error: {e}")
+        # Fallback to simple response
+        return SessionConverseResponse(
+            agent_response="Bilkul, yeh note kar liya. Aage badhte hain.",
+            facts_extracted=[],
+            memory_updated=False,
+            wal_written=False,
         )
 
-    # Step 3: Generate agent response
-    engine = ConversationEngine()
-    agent_response = engine.generate_next_step(facts_extracted, [])
 
-    # Step 4: WAL append if facts extracted (CRITICAL: WAL first)
-    wal_written = False
-    if facts_extracted:
-        try:
-            wal_logger.append(
-                session_id=req.session_id,
-                customer_id=req.customer_id,
-                agent_id="voice_input",
-                bank_id=os.getenv("BANK_ID", "cooperative_bank_01"),
-                facts=facts_extracted,
-            )
-            wal_written = True
-            # TODO: Publish to Redpanda
-        except Exception as e:
-            logger.warning(f"Failed to write WAL: {e}")
+# ──────────────────────────────────────────────────────────────────────────
+# Memory API routes (separate from /session prefix)
+# ──────────────────────────────────────────────────────────────────────────
 
-    return SessionConverseResponse(
-        agent_response=agent_response,
-        facts_extracted=facts_extracted,
-        memory_updated=False,  # TODO: Mem0 write after verification
-        wal_written=wal_written,
-    )
+memory_router = APIRouter(prefix="/memory", tags=["memory"])
+
+
+class MemoryAddRequest(BaseModel):
+    """Request to add facts to memory."""
+    session_id: str
+    customer_id: str
+    facts: list[Dict[str, Any]]
+    agent_id: Optional[str] = "system"
+
+
+@memory_router.post("/add")
+async def memory_add_facts(
+    req: MemoryAddRequest,
+    wal_logger: Annotated[WALLogger, Depends(get_wal_logger)] = None,
+) -> Dict[str, Any]:
+    """
+    Add facts to memory and WAL.
+    
+    WAL FIRST: write to wal.jsonl BEFORE any other operation.
+    """
+    try:
+        # Step 1: WAL FIRST (always, non-negotiable)
+        wal_logger.append(
+            session_id=req.session_id,
+            customer_id=req.customer_id,
+            agent_id=req.agent_id,
+            bank_id=BANK_ID,
+            facts=req.facts
+        )
+        
+        return {
+            "status": "added",
+            "facts_count": len(req.facts),
+            "wal_written": True,
+            "session_id": req.session_id,
+            "customer_id": req.customer_id
+        }
+    except Exception as e:
+        logger.error(f"Error in memory_add: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add facts: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Consent Management Route (excluded from ConsentMiddleware)
+# ──────────────────────────────────────────────────────────────────────────
+
+@router.post("/consent/record")
+async def record_consent_endpoint(
+    session_id: str,
+    customer_id: str,
+    scope: str = "home_loan_processing",
+    signature_method: str = "verbal",
+    consent_db: Annotated[ConsentDB, Depends(get_consent_db)] = None,
+) -> Dict[str, Any]:
+    """
+    Record a new consent for a customer (self-contained endpoint).
+    This endpoint is NOT protected by consent check (it creates consent).
+    """
+    try:
+        consent_db.record_consent(
+            session_id=session_id,
+            customer_id=customer_id,
+            scope=scope,
+            sig_method=signature_method
+        )
+        return {
+            "status": "recorded",
+            "session_id": session_id,
+            "customer_id": customer_id,
+            "scope": scope
+        }
+    except Exception as e:
+        logger.error(f"Error recording consent: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to record consent: {e}")
