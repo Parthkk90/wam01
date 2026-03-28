@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BrainBack.AI — Loan Officer Terminal</title>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Sora:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg: #0a0f0d;
+            --surface: #111a15;
+            --border: #1e3028;
+            --green: #00e676;
+            --green-dim: #00c853;
+            --red: #ff1744;
+            --text: #e8f5e9;
+            --muted: #4a7a5a;
+            --mono: 'DM Mono', monospace;
+            --sans: 'Sora', sans-serif;
+        }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--sans);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: 
+                linear-gradient(90deg, var(--surface) 1px, transparent 1px) 0 0 / 40px 40px,
+                linear-gradient(var(--surface) 1px, transparent 1px) 0 0 / 40px 40px;
+            opacity: 0.2;
+            z-index: -1;
+        }
+        .main-container {
+            width: 90%;
+            max-width: 800px;
+            background: rgba(17, 26, 21, 0.8);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 40px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(10px);
+            text-align: center;
+        }
+        .header {
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            letter-spacing: -1px;
+            margin-bottom: 5px;
+            background: linear-gradient(90deg, #fff, var(--green));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .header p {
+            font-family: var(--mono);
+            color: var(--muted);
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 2px;
+        }
+        .call-card {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 40px;
+            margin: 30px 0;
+            position: relative;
+            overflow: hidden;
+        }
+        .pulse-ring {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 100px; height: 100px;
+            border: 2px solid var(--green);
+            border-radius: 50%;
+            opacity: 0;
+        }
+        .active .pulse-ring {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: translate(-50%, -50%) scale(0.8); opacity: 0.8; }
+            100% { transform: translate(-50%, -50%) scale(2.5); opacity: 0; }
+        }
+        .btn-call {
+            width: 80px; height: 80px;
+            border-radius: 50%;
+            border: none;
+            background: var(--green);
+            color: var(--bg);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto;
+            transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            font-size: 2rem;
+            position: relative;
+            z-index: 10;
+        }
+        .btn-call:hover { transform: scale(1.1); box-shadow: 0 0 30px rgba(0, 230, 118, 0.4); }
+        .btn-call:active { transform: scale(0.95); }
+        .btn-call.active { background: var(--red); color: white; transform: rotate(135deg); }
+        .status-container {
+            margin-top: 20px;
+            font-family: var(--mono);
+            font-size: 0.9rem;
+        }
+        .status-label {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 4px;
+            background: var(--surface);
+            color: var(--muted);
+            margin-bottom: 10px;
+        }
+        .status-text { color: var(--green); font-weight: 500; }
+        .status-text.error { color: var(--red); }
+        .log-panel {
+            margin-top: 30px;
+            height: 200px;
+            background: #050807;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: left;
+            overflow-y: auto;
+            font-family: var(--mono);
+            font-size: 0.8rem;
+            color: #889988;
+        }
+        .log-entry { margin-bottom: 8px; border-left: 2px solid var(--border); padding-left: 10px; }
+        .log-entry.system { color: var(--muted); }
+        .log-entry.user { color: var(--green); }
+        .log-entry.ai { color: #fff; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="main-container">
+        <div class="header">
+            <h1>BrainBack.AI</h1>
+            <p>Loan Officer Voice System v1.0.4</p>
+        </div>
+
+        <div class="call-card" id="callCard">
+            <div class="pulse-ring"></div>
+            <button class="btn-call" id="callBtn">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M20 15.5c-1.25 0-2.45-.2-3.57-.57-.35-.11-.74-.03-1.02.24l-2.2 2.2c-2.83-1.44-5.15-3.75-6.59-6.59l2.2-2.21c.28-.26.36-.65.25-1C8.7 6.45 8.5 5.25 8.5 4c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1 0 9.39 7.61 17 17 17 .55 0 1-.45 1-1v-3.5c0-.55-.45-1-1-1zM19 12h2c0-4.97-4.03-9-9-9v2c3.87 0 7 3.13 7 7zm-4 0h2c0-2.76-2.24-5-5-5v2c1.66 0 3 1.34 3 3z"/>
+                </svg>
+            </button>
+            <div class="status-container">
+                <span class="status-label">SYSTEM_STATUS</span><br>
+                <span class="status-text" id="statusText">READY_FOR_COMMUNICATION</span>
+            </div>
+        </div>
+
+        <div class="log-panel" id="logPanel">
+            <div class="log-entry system">> [INIT] Establishing cryptographic handshake...</div>
+            <div class="log-entry system">> [INIT] Syncing with Vapi Cloud Core...</div>
+        </div>
+    </div>
+
+    <!-- SDK Loader Script -->
+    <script type="module">
+        import Vapi from 'https://esm.sh/@vapi-ai/web';
+        window.Vapi = Vapi;
+        
+        const logPanel = document.getElementById('logPanel');
+        function addLog(msg, type='system') {
+            const div = document.createElement('div');
+            div.className = `log-entry ${type}`;
+            div.textContent = `> [${new Date().toLocaleTimeString()}] ${msg}`;
+            logPanel.appendChild(div);
+            logPanel.scrollTop = logPanel.scrollHeight;
+        }
+        addLog("Vapi SDK initialized via Secure ESM Tunnel.", "system");
+        
+        // Expose functions to window for the UI to use
+        window.addLog = addLog;
+    </script>
+
+    <script>
+        let vapi = null;
+        let config = null;
+        const callBtn = document.getElementById('callBtn');
+        const callCard = document.getElementById('callCard');
+        const statusText = document.getElementById('statusText');
+
+        // 1. Fetch config from backend
+        async function fetchConfig() {
+            try {
+                const response = await fetch('/api/config');
+                config = await response.json();
+                if (!config.publicKey || !config.assistantId) {
+                    throw new Error("Missing VAPI_PUBLIC_KEY or VAPI_ASSISTANT_ID in .env");
+                }
+                updateStatus("SYSTEM_READY", "success");
+            } catch (err) {
+                console.error("Config fetch error:", err);
+                updateStatus("CONFIG_ERROR: Check .env file", "error");
+            }
+        }
+
+        function updateStatus(text, type) {
+            statusText.textContent = text.toUpperCase();
+            statusText.className = 'status-text ' + (type === 'error' ? 'error' : '');
+        }
+
+        async function toggleCall() {
+            if (!config) {
+                alert("Config not loaded. Please wait.");
+                return;
+            }
+
+            if (typeof Vapi !== 'function') {
+                updateStatus("SDK_LOADING_FAILURE", "error");
+                console.error("Vapi class not found in memory!");
+                return;
+            }
+
+            if (!vapi) {
+                // START CALL
+                vapi = new Vapi(config.publicKey);
+                updateStatus("CONNECTING...", "success");
+                
+                vapi.start(config.assistantId);
+
+                vapi.on('call-start', () => {
+                    updateStatus("IN_CALL", "success");
+                    callBtn.classList.add('active');
+                    callCard.classList.add('active');
+                    if(window.addLog) window.addLog("Call established successfully.", "system");
+                });
+
+                vapi.on('call-end', () => {
+                    cleanup();
+                });
+
+                vapi.on('message', (msg) => {
+                    if (msg.type === 'transcript' && msg.transcriptType === 'final') {
+                        const speaker = msg.role === 'user' ? 'USER' : 'AI';
+                        if(window.addLog) window.addLog(`${speaker}: ${msg.transcript}`, msg.role);
+                    }
+                });
+
+                vapi.on('error', (err) => {
+                    console.error("Vapi Error:", err);
+                    updateStatus("CONNECTION_FAILED", "error");
+                    cleanup();
+                });
+
+            } else {
+                // STOP CALL
+                vapi.stop();
+                cleanup();
+            }
+        }
+
+        function cleanup() {
+            if(vapi) {
+                vapi = null;
+            }
+            updateStatus("CALL_ENDED", "success");
+            callBtn.classList.remove('active');
+            callCard.classList.remove('active');
+            if(window.addLog) window.addLog("Call ended.", "system");
+            setTimeout(() => {
+                if(!vapi) updateStatus("READY_FOR_COMMUNICATION", "success");
+            }, 3000);
+        }
+
+        callBtn.onclick = toggleCall;
+        fetchConfig();
+    </script>
+</body>
+</html>
