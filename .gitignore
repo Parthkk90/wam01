@@ -1,0 +1,4 @@
+redis-data/
+postgres-data/
+*.rdb
+.env
